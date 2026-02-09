@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use url::Url;
+use reqwest::header::CONTENT_TYPE;
+use base64::Engine;
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about = "Convert Bugzilla bugs to Markdown summaries")]
@@ -19,7 +21,7 @@ struct Args {
     #[clap(short, long, default_value = "https://bugzilla.mozilla.org")]
     instance: String,
 
-    /// Output directory for markdown file and attachments (default: /tmp)
+    /// Output directory for markdown file and attachments (default: current directory)
     #[clap(short, long)]
     output_dir: Option<PathBuf>,
 
@@ -216,7 +218,7 @@ fn get_output_dir(args: &Args) -> Result<PathBuf> {
         return Ok(dir);
     }
 
-    Ok(PathBuf::from("/tmp"))
+    Ok(PathBuf::from("."))
 }
 
 fn parse_bug_input(input: &str, instance: &str) -> Result<(String, u64)> {
@@ -518,6 +520,12 @@ async fn download_attachment(
     if let Some(api_key) = read_api_key() {
         url.push_str(&format!("?api_key={}", api_key));
     }
+    // Ask for the data field, which is base64-encoded
+    if url.contains('?') {
+        url.push_str("&include_fields=data");
+    } else {
+        url.push_str("?include_fields=data");
+    }
 
     let client = reqwest::Client::new();
     let response = client
@@ -538,24 +546,80 @@ async fn download_attachment(
         .progress_chars("#>-"));
     pb.set_message(format!("Downloading {}", attachment.file_name));
 
-    let file_path = output_dir.join(&attachment.file_name);
-    let mut file = File::create(&file_path).await?;
-    let mut stream = response.bytes_stream();
-    let mut downloaded = 0u64;
+    // If Bugzilla returns JSON, extract and decode base64 data; otherwise stream bytes.
+    let ct = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
 
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        file.write_all(&chunk).await?;
-        downloaded += chunk.len() as u64;
-        pb.set_position(downloaded);
+    // Prefer metadata content-type for naming; otherwise fall back to response header
+    let effective_mime = if !attachment.content_type.is_empty() {
+        attachment.content_type.to_ascii_lowercase()
+    } else if !ct.is_empty() {
+        ct.clone()
+    } else {
+        String::new()
+    };
+
+    let saved_name = sanitize_filename_for_mime(&attachment.file_name, &effective_mime);
+    let file_path = output_dir.join(&saved_name);
+
+    if ct.contains("application/json") {
+        let body_bytes = response.bytes().await?;
+        pb.set_position(body_bytes.len() as u64);
+
+        #[derive(Deserialize)]
+        struct AttachmentDataEntry {
+            id: Option<u64>,
+            data: Option<String>,
+            file_name: Option<String>,
+            content_type: Option<String>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum AttachmentDataResponse {
+            Vec { attachments: Vec<AttachmentDataEntry> },
+            Map { attachments: std::collections::HashMap<String, AttachmentDataEntry> },
+        }
+
+        let parsed: AttachmentDataResponse = serde_json::from_slice(&body_bytes)
+            .context("Failed to parse attachment JSON (data)")?;
+        let entry_opt = match parsed {
+            AttachmentDataResponse::Vec { mut attachments } => attachments.pop(),
+            AttachmentDataResponse::Map { mut attachments } => attachments.into_values().next(),
+        };
+        let entry = entry_opt.context("Missing attachment data in response")?;
+        let b64 = entry.data.context("No data field found in attachment response")?;
+
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(b64.as_bytes())
+            .context("Failed to base64-decode attachment data")?;
+        tokio::fs::write(&file_path, &decoded).await?;
+
+        pb.finish_with_message(format!("Downloaded {}", attachment.file_name));
+    } else {
+        let mut file = File::create(&file_path).await?;
+        let mut stream = response.bytes_stream();
+        let mut downloaded = 0u64;
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            file.write_all(&chunk).await?;
+            downloaded += chunk.len() as u64;
+            pb.set_position(downloaded);
+        }
+
+        pb.finish_with_message(format!("Downloaded {}", attachment.file_name));
     }
 
-    pb.finish_with_message(format!("Downloaded {}", attachment.file_name));
-
+    // Try to decompress based on extension and magic bytes for direct usability
     let decompressed = decompress_file(&file_path).await?;
 
     Ok(DownloadSummary {
-        file_name: attachment.file_name.clone(),
+        file_name: saved_name,
         size: attachment.size,
         mime_type: attachment.content_type.clone(),
         decompressed,
@@ -568,14 +632,19 @@ async fn decompress_file(file_path: &Path) -> Result<bool> {
     if file_name.ends_with(".zst") || file_name.ends_with(".zstd") {
         decompress_zstd(file_path).await?;
         return Ok(true);
-    } else if file_name.ends_with(".gz") {
-        decompress_gzip(file_path).await?;
-        return Ok(true);
     } else if file_name.ends_with(".tar.gz") || file_name.ends_with(".tgz") {
         decompress_tar_gz(file_path).await?;
         return Ok(true);
+    } else if file_name.ends_with(".gz") {
+        decompress_gzip(file_path).await?;
+        return Ok(true);
     } else if file_name.ends_with(".zip") {
         decompress_zip(file_path).await?;
+        return Ok(true);
+    }
+
+    // Fallback: check magic bytes if no clear extension
+    if detect_and_decompress_by_magic(file_path).await? {
         return Ok(true);
     }
 
@@ -649,6 +718,35 @@ async fn decompress_zstd(file_path: &Path) -> Result<()> {
     Ok(())
 }
 
+async fn detect_and_decompress_by_magic(file_path: &Path) -> Result<bool> {
+    use tokio::io::AsyncReadExt;
+
+    let mut f = tokio::fs::File::open(file_path).await?;
+    let mut header = [0u8; 4];
+    let n = f.read(&mut header).await?;
+    if n < 2 {
+        return Ok(false);
+    }
+
+    // gzip magic: 1F 8B
+    if header[0] == 0x1F && header[1] == 0x8B {
+        decompress_gzip(file_path).await?;
+        return Ok(true);
+    }
+    // zstd magic: 28 B5 2F FD
+    if n >= 4 && header == [0x28, 0xB5, 0x2F, 0xFD] {
+        decompress_zstd(file_path).await?;
+        return Ok(true);
+    }
+    // zip magic: PK\x03\x04, PK\x05\x06, PK\x07\x08
+    if n >= 4 && ((&header == b"PK\x03\x04") || (&header == b"PK\x05\x06") || (&header == b"PK\x07\x08")) {
+        decompress_zip(file_path).await?;
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
 fn is_phabricator_link(attachment: &Attachment) -> bool {
     attachment.content_type == "text/x-phabricator-request"
 }
@@ -658,7 +756,6 @@ fn extract_differential_revision(attachment: &Attachment) -> Option<String> {
         return None;
     }
 
-    // Try to extract Dxxxx from the file name (e.g., "phabricator-D123456-url.txt")
     if let Some(caps) = attachment.file_name
         .strip_prefix("phabricator-D")
         .and_then(|s| s.split('-').next())
@@ -666,7 +763,6 @@ fn extract_differential_revision(attachment: &Attachment) -> Option<String> {
         return Some(format!("D{}", caps));
     }
 
-    // Fallback: check the summary field
     if attachment.summary.starts_with("Bug ") {
         if let Some(d_idx) = attachment.summary.find(" - D") {
             let after_d = &attachment.summary[d_idx + 4..];
@@ -679,6 +775,51 @@ fn extract_differential_revision(attachment: &Attachment) -> Option<String> {
     }
 
     None
+}
+
+fn sanitize_filename_for_mime(original: &str, mime: &str) -> String {
+    let lower_mime = mime.to_ascii_lowercase();
+    if lower_mime.starts_with("text/html") {
+        let mut name = original.to_string();
+        let lower = name.to_ascii_lowercase();
+        if lower.ends_with(".html") {
+            let mut base = name[..name.len()-5].to_string();
+            let mut lowered = base.to_ascii_lowercase();
+            let suffixes = [".zip", ".gz", ".zst", ".tgz", ".tar", ".tar.gz"];
+            let mut changed = true;
+            while changed {
+                changed = false;
+                for suf in &suffixes {
+                    if lowered.ends_with(suf) {
+                        let new_len = base.len() - suf.len();
+                        base.truncate(new_len);
+                        lowered.truncate(new_len);
+                        changed = true;
+                    }
+                }
+            }
+            if base.is_empty() { base = "attachment".to_string(); }
+            return format!("{}.html", base);
+        }
+        let mut base = original.to_string();
+        let mut lowered = base.to_ascii_lowercase();
+        let suffixes = [".zip", ".gz", ".zst", ".tgz", ".tar", ".tar.gz"];
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for suf in &suffixes {
+                if lowered.ends_with(suf) {
+                    let new_len = base.len() - suf.len();
+                    base.truncate(new_len);
+                    lowered.truncate(new_len);
+                    changed = true;
+                }
+            }
+        }
+        if base.is_empty() { base = "attachment".to_string(); }
+        return format!("{}.html", base);
+    }
+    original.to_string()
 }
 
 #[tokio::main]
