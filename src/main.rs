@@ -572,9 +572,12 @@ async fn download_attachment(
 
         #[derive(Deserialize)]
         struct AttachmentDataEntry {
+            #[allow(dead_code)]
             id: Option<u64>,
             data: Option<String>,
+            #[allow(dead_code)]
             file_name: Option<String>,
+            #[allow(dead_code)]
             content_type: Option<String>,
         }
 
@@ -589,7 +592,7 @@ async fn download_attachment(
             .context("Failed to parse attachment JSON (data)")?;
         let entry_opt = match parsed {
             AttachmentDataResponse::Vec { mut attachments } => attachments.pop(),
-            AttachmentDataResponse::Map { mut attachments } => attachments.into_values().next(),
+            AttachmentDataResponse::Map { attachments } => attachments.into_values().next(),
         };
         let entry = entry_opt.context("Missing attachment data in response")?;
         let b64 = entry.data.context("No data field found in attachment response")?;
@@ -778,9 +781,22 @@ fn extract_differential_revision(attachment: &Attachment) -> Option<String> {
 }
 
 fn sanitize_filename_for_mime(original: &str, mime: &str) -> String {
+    // Ensure we only keep a filename (no directories or absolute paths)
+    let mut safe_name = std::path::Path::new(original)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("attachment")
+        .to_string();
+
+    // Basic sanitization: replace path separators and control characters
+    safe_name = safe_name
+        .chars()
+        .map(|c| if c == '/' || c == '\\' || c.is_control() { '_' } else { c })
+        .collect();
+
     let lower_mime = mime.to_ascii_lowercase();
     if lower_mime.starts_with("text/html") {
-        let mut name = original.to_string();
+        let name = safe_name;
         let lower = name.to_ascii_lowercase();
         if lower.ends_with(".html") {
             let mut base = name[..name.len()-5].to_string();
@@ -801,7 +817,7 @@ fn sanitize_filename_for_mime(original: &str, mime: &str) -> String {
             if base.is_empty() { base = "attachment".to_string(); }
             return format!("{}.html", base);
         }
-        let mut base = original.to_string();
+        let mut base = name.to_string();
         let mut lowered = base.to_ascii_lowercase();
         let suffixes = [".zip", ".gz", ".zst", ".tgz", ".tar", ".tar.gz"];
         let mut changed = true;
@@ -819,7 +835,7 @@ fn sanitize_filename_for_mime(original: &str, mime: &str) -> String {
         if base.is_empty() { base = "attachment".to_string(); }
         return format!("{}.html", base);
     }
-    original.to_string()
+    safe_name
 }
 
 #[tokio::main]
