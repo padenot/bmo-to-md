@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use url::Url;
-use reqwest::header::CONTENT_TYPE;
+use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use base64::Engine;
 
 #[derive(Parser, Debug)]
@@ -252,6 +252,7 @@ async fn fetch_comments(instance: &str, bug_id: u64) -> Result<Vec<Comment>> {
     let client = reqwest::Client::new();
     let response = client
         .get(&url)
+        .header(ACCEPT, "application/json")
         .send()
         .await
         .context("Failed to send request for comments to Bugzilla")?;
@@ -286,6 +287,7 @@ async fn fetch_bug(instance: &str, bug_id: u64) -> Result<Bug> {
     let client = reqwest::Client::new();
     let response = client
         .get(&url)
+        .header(ACCEPT, "application/json")
         .send()
         .await
         .context("Failed to send request to Bugzilla")?;
@@ -316,6 +318,7 @@ async fn fetch_attachments(instance: &str, bug_id: u64) -> Result<Vec<Attachment
     let client = reqwest::Client::new();
     let response = client
         .get(&url)
+        .header(ACCEPT, "application/json")
         .send()
         .await
         .context("Failed to send request for attachments to Bugzilla")?;
@@ -338,10 +341,6 @@ async fn fetch_attachments(instance: &str, bug_id: u64) -> Result<Vec<Attachment
         .next()
         .map(|(_, attachments)| attachments)
         .unwrap_or_default())
-}
-
-fn bug_to_markdown(bug: &Bug, comments: &[Comment], instance: &str) -> String {
-    bug_to_markdown_with_diffs(bug, comments, instance, &[])
 }
 
 fn bug_to_markdown_with_diffs(bug: &Bug, comments: &[Comment], instance: &str, diffs: &[String]) -> String {
@@ -530,6 +529,7 @@ async fn download_attachment(
     let client = reqwest::Client::new();
     let response = client
         .get(&url)
+        .header(ACCEPT, "application/json")
         .send()
         .await
         .context("Failed to download attachment")?;
